@@ -414,6 +414,7 @@ source_set("libcef_static_unittested") {
     "libcef/browser/devtools/devtools_util.h",
     "libcef/browser/geometry_util.h",
     "libcef/browser/geometry_util.cc",
+    "libcef/browser/osr/external_begin_frame_request_state.h",
   ]
 
   deps = [
@@ -439,6 +440,7 @@ test("libcef_static_unittests") {
   sources = [
     "libcef/browser/devtools/devtools_util_unittest.cc",
     "libcef/browser/geometry_util_unittest.cc",
+    "libcef/browser/osr/external_begin_frame_request_state_unittest.cc",
   ]
 
   deps = [
