@@ -2243,6 +2243,9 @@ class ExternalBeginFrameTimingTestHandler : public RoutingTestHandler,
       : accelerated_(accelerated) {}
 
   bool readback_unavailable() const { return readback_unavailable_; }
+  bool shared_texture_unavailable() const {
+    return shared_texture_unavailable_;
+  }
 
   void RunTest() override {
     SetTestTimeout(15000);
@@ -2313,7 +2316,19 @@ class ExternalBeginFrameTimingTestHandler : public RoutingTestHandler,
     if (type != PET_VIEW || !started_ || finished_) {
       return;
     }
-    EXPECT_FALSE(accelerated_);
+    if (accelerated_) {
+      // Chromium delivers OnPaint when GPU compositing is unavailable, for
+      // example after the GPU process fails to initialize.
+      if (!shared_texture_unavailable_) {
+        shared_texture_unavailable_ = true;
+        // Closing the browser from within OnPaint is unsafe.
+        CefPostTask(
+            TID_UI,
+            base::BindOnce(&ExternalBeginFrameTimingTestHandler::DestroyTest,
+                           this));
+      }
+      return;
+    }
     const auto* pixels = static_cast<const uint32_t*>(buffer);
     RecordFrame(Clock::now(), WallMilliseconds(), pixels[0], pixels[width / 2]);
   }
@@ -2336,7 +2351,7 @@ class ExternalBeginFrameTimingTestHandler : public RoutingTestHandler,
 
   void DestroyTest() override {
     finished_ = true;
-    if (!readback_unavailable_) {
+    if (!readback_unavailable_ && !shared_texture_unavailable_) {
       EXPECT_EQ(2, phase_);
     }
     if (pixel_reader_) {
@@ -2468,6 +2483,7 @@ class ExternalBeginFrameTimingTestHandler : public RoutingTestHandler,
 
   const bool accelerated_;
   bool readback_unavailable_ = false;
+  bool shared_texture_unavailable_ = false;
   std::unique_ptr<osr_unittests::SharedTexturePixelReader> pixel_reader_;
   bool started_ = false;
   bool finished_ = false;
@@ -2522,10 +2538,14 @@ TEST(OSRTest, ExternalBeginFrameTimingAccelerated) {
   CefRefPtr<ExternalBeginFrameTimingTestHandler> handler =
       new ExternalBeginFrameTimingTestHandler(true);
   handler->ExecuteTest();
-  const bool unavailable = handler->readback_unavailable();
+  const bool readback_unavailable = handler->readback_unavailable();
+  const bool shared_texture_unavailable = handler->shared_texture_unavailable();
   ReleaseAndWaitForDestructor(handler);
-  if (unavailable) {
+  if (readback_unavailable) {
     GTEST_SKIP() << "Shared texture readback is unavailable";
+  }
+  if (shared_texture_unavailable) {
+    GTEST_SKIP() << "Shared texture painting is unavailable";
   }
 }
 
