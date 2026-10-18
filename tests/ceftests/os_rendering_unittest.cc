@@ -2,12 +2,19 @@
 // reserved. Use of this source code is governed by a BSD-style license that
 // can be found in the LICENSE file.
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <vector>
+
 #include "include/base/cef_callback.h"
 #include "include/base/cef_logging.h"
+#include "include/cef_command_line.h"
 #include "include/cef_parser.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_stream_resource_handler.h"
+#include "tests/ceftests/os_rendering_unittest_shared_texture.h"
 #include "tests/ceftests/routing_test_handler.h"
 #include "tests/ceftests/test_util.h"
 #include "tests/gtest/include/gtest/gtest.h"
@@ -2225,6 +2232,285 @@ class SingleBeginFrameTestHandler : public RoutingTestHandler,
   IMPLEMENT_REFCOUNTING(SingleBeginFrameTestHandler);
 };
 
+// Exercise the real renderer/compositor path. The request-state unit tests
+// cover serialization; this test checks the cadence of animated page pixels
+// delivered to the paint callbacks, including a change to the configured frame
+// rate.
+class ExternalBeginFrameTimingTestHandler : public RoutingTestHandler,
+                                            public CefRenderHandler {
+ public:
+  explicit ExternalBeginFrameTimingTestHandler(bool accelerated)
+      : accelerated_(accelerated) {}
+
+  bool readback_unavailable() const { return readback_unavailable_; }
+
+  void RunTest() override {
+    SetTestTimeout(15000);
+    if (accelerated_) {
+      pixel_reader_ = osr_unittests::CreateSharedTexturePixelReader();
+      if (!pixel_reader_->Initialize()) {
+        readback_unavailable_ = true;
+        DestroyTest();
+        return;
+      }
+    }
+    const char kUrl[] = "https://tests/external_begin_frame_timing";
+    AddResource(kUrl, R"(
+      <html style="background:black"><body>
+      <div style="position:fixed;left:0;top:0;width:4px;height:4px;
+                  background:#00ff00"></div><script>
+      window.workMs = 12;
+      function animate() {
+        // Encode the creation time in the pixels so an old frame arriving on
+        // cadence cannot pass as the current frame. The clock wraps in 4.6h.
+        const stamp = Date.now() % 0x1000000;
+        // Main-thread work must finish before this tick's draw deadline.
+        const start = performance.now();
+        while (performance.now() - start < window.workMs) {}
+        document.documentElement.style.backgroundColor =
+            'rgb(' + (stamp >> 16) + ',' + ((stamp >> 8) & 255) +
+            ',' + (stamp & 255) + ')';
+        requestAnimationFrame(animate);
+      }
+      requestAnimationFrame(animate);
+      </script></body></html>)",
+                "text/html");
+    CefWindowInfo window_info;
+    window_info.SetAsWindowless(kNullWindowHandle);
+    window_info.external_begin_frame_enabled = true;
+    window_info.shared_texture_enabled = accelerated_;
+    CefBrowserSettings settings;
+    settings.windowless_frame_rate = 50;
+    CefBrowserHost::CreateBrowser(window_info, this, kUrl, settings, nullptr,
+                                  nullptr);
+  }
+
+  CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
+
+  void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override {
+    rect = CefRect(0, 0, 160, 120);
+  }
+
+  void OnLoadEnd(CefRefPtr<CefBrowser> browser,
+                 CefRefPtr<CefFrame> frame,
+                 int http_status_code) override {
+    if (!frame->IsMain() || started_) {
+      return;
+    }
+    EXPECT_EQ(200, http_status_code);
+    started_ = true;
+    next_tick_ = Clock::now();
+    Tick();
+  }
+
+  void OnPaint(CefRefPtr<CefBrowser> browser,
+               PaintElementType type,
+               const RectList& dirty_rects,
+               const void* buffer,
+               int width,
+               int height) override {
+    if (type != PET_VIEW || !started_ || finished_) {
+      return;
+    }
+    EXPECT_FALSE(accelerated_);
+    const auto* pixels = static_cast<const uint32_t*>(buffer);
+    RecordFrame(Clock::now(), WallMilliseconds(), pixels[0], pixels[width / 2]);
+  }
+
+  void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                          PaintElementType type,
+                          const RectList& dirty_rects,
+                          const CefAcceleratedPaintInfo& info) override {
+    if (type != PET_VIEW || !started_ || finished_) {
+      return;
+    }
+    const auto now = Clock::now();
+    const auto wall_ms = WallMilliseconds();
+    ASSERT_TRUE(accelerated_);
+    uint32_t marker = 0;
+    uint32_t pixel = 0;
+    ASSERT_TRUE(pixel_reader_->Read(info, &marker, &pixel));
+    RecordFrame(now, wall_ms, marker, pixel);
+  }
+
+  void DestroyTest() override {
+    finished_ = true;
+    if (!readback_unavailable_) {
+      EXPECT_EQ(2, phase_);
+    }
+    if (pixel_reader_) {
+      pixel_reader_->Cleanup();
+      pixel_reader_.reset();
+    }
+    RoutingTestHandler::DestroyTest();
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  using Milliseconds = std::chrono::duration<double, std::milli>;
+
+  static int64_t WallMilliseconds() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void RecordFrame(Clock::time_point now,
+                   int64_t wall_ms,
+                   uint32_t marker,
+                   uint32_t pixel) {
+    if (marker != 0xff00ff00U || pixel == last_pixel_) {
+      return;
+    }
+    last_pixel_ = pixel;
+    if (ticks_ > kWarmupTicks && last_paint_ != Clock::time_point()) {
+      const double elapsed_ms = Milliseconds(now - last_paint_).count();
+      // Compare against the actual requests, excluding timer wake-up jitter
+      // from the renderer/compositor's delivery jitter.
+      const double requested_ms =
+          Milliseconds(tick_time_ - last_paint_tick_time_).count();
+      int64_t frame_age_ms = (wall_ms - (pixel & 0xffffffU)) & 0xffffff;
+      if (frame_age_ms > 0x7fffff) {
+        frame_age_ms -= 0x1000000;
+      }
+      measurements_.push_back({ticks_, last_paint_tick_,
+                               std::abs(elapsed_ms - requested_ms),
+                               frame_age_ms});
+    }
+    last_paint_ = now;
+    last_paint_tick_time_ = tick_time_;
+    last_paint_tick_ = ticks_;
+  }
+
+  static constexpr int kWarmupTicks = 20;
+  static constexpr int kSampleTicks = 50;
+  // Half of the shortest tick period. Measure only while the request clock
+  // meets this allowance; a late test timer is not a compositor regression.
+  static constexpr double kJitterAllowanceMs = 10;
+
+  struct Measurement {
+    int tick;
+    int previous_tick;
+    double jitter_ms;
+    int64_t frame_age_ms;
+  };
+
+  void UpdateMeasurements() {
+    samples_ = 0;
+    max_jitter_ms_ = 0;
+    max_frame_age_ms_ = 0;
+    min_frame_age_ms_ = 0;
+    max_paint_gap_ticks_ = 0;
+    for (const auto& measurement : measurements_) {
+      // A ready paint may run before the late timer task. Filter after the
+      // next tick, so both sides of a clock stall and its recovery are known.
+      if (std::any_of(late_ticks_.begin(), late_ticks_.end(),
+                      [&measurement](int tick) {
+                        return measurement.previous_tick <= tick + 2 &&
+                               measurement.tick >= tick - 1;
+                      })) {
+        continue;
+      }
+      ++samples_;
+      max_jitter_ms_ = std::max(max_jitter_ms_, measurement.jitter_ms);
+      max_frame_age_ms_ = std::max(max_frame_age_ms_, measurement.frame_age_ms);
+      min_frame_age_ms_ = std::min(min_frame_age_ms_, measurement.frame_age_ms);
+      max_paint_gap_ticks_ = std::max(
+          max_paint_gap_ticks_, measurement.tick - measurement.previous_tick);
+    }
+  }
+
+  void Tick() {
+    if (finished_) {
+      return;
+    }
+    ++ticks_;
+    const double lateness_ms = Milliseconds(Clock::now() - next_tick_).count();
+    if (lateness_ms > kJitterAllowanceMs) {
+      late_ticks_.push_back(ticks_);
+    }
+    if (ticks_ > kWarmupTicks) {
+      max_tick_lateness_ms_ = std::max(max_tick_lateness_ms_, lateness_ms);
+    }
+    UpdateMeasurements();
+    // Collect 50 valid intervals, with a bounded allowance for late test timer
+    // wake-ups and sampling boundaries. Regular-clock paint gaps still fail.
+    if (samples_ >= kSampleTicks || ticks_ > kWarmupTicks + kSampleTicks + 20) {
+      // Assert after sampling so failure reporting cannot perturb later paints.
+      LOG(INFO) << "External BeginFrame phase=" << phase_
+                << ", samples=" << samples_
+                << ", max paint jitter=" << max_jitter_ms_
+                << "ms, max tick lateness=" << max_tick_lateness_ms_
+                << "ms, max frame age=" << max_frame_age_ms_ << "ms";
+      EXPECT_GE(samples_, kSampleTicks) << "phase=" << phase_;
+      EXPECT_LE(max_jitter_ms_, kJitterAllowanceMs) << "phase=" << phase_;
+      EXPECT_LE(max_paint_gap_ticks_, 1) << "phase=" << phase_;
+      // Frame age includes both the permitted request-clock lateness and
+      // renderer/compositor delivery jitter. The delivery check above removes
+      // request jitter and independently enforces the 10ms allowance.
+      EXPECT_LE(max_frame_age_ms_, interval_ms_ + 2 * kJitterAllowanceMs)
+          << "phase=" << phase_;
+      EXPECT_GE(min_frame_age_ms_, -1) << "phase=" << phase_;
+      if (++phase_ == 2) {
+        DestroyTest();
+        return;
+      }
+      interval_ms_ = 40;
+      GetBrowser()->GetHost()->SetWindowlessFrameRate(25);
+      // Fit inside the new 40ms interval, but exceed the old fixed 16.67ms
+      // interval so that using the wrong deadline loses main-thread updates.
+      GetBrowser()->GetMainFrame()->ExecuteJavaScript(
+          "window.workMs = 24;", GetBrowser()->GetMainFrame()->GetURL(), 0);
+      ticks_ = 1;
+      max_tick_lateness_ms_ = 0;
+      measurements_.clear();
+      late_ticks_.clear();
+      last_paint_ = Clock::time_point();
+      next_tick_ = Clock::now();
+    }
+    const auto now = Clock::now();
+    tick_time_ = now;
+    // A late wake-up must not produce a burst of overlapping catch-up frames.
+    next_tick_ = now + std::chrono::milliseconds(interval_ms_);
+    GetBrowser()->GetHost()->SendExternalBeginFrame();
+    const auto delay =
+        std::chrono::ceil<std::chrono::milliseconds>(next_tick_ - Clock::now());
+    CefPostDelayedTask(
+        TID_UI,
+        base::BindOnce(&ExternalBeginFrameTimingTestHandler::Tick, this),
+        std::max<int64_t>(0, delay.count()));
+  }
+
+  const bool accelerated_;
+  bool readback_unavailable_ = false;
+  std::unique_ptr<osr_unittests::SharedTexturePixelReader> pixel_reader_;
+  bool started_ = false;
+  bool finished_ = false;
+  int phase_ = 0;
+  int interval_ms_ = 20;
+  int ticks_ = 0;
+  int samples_ = 0;
+  double max_jitter_ms_ = 0;
+  double max_tick_lateness_ms_ = 0;
+  int64_t max_frame_age_ms_ = 0;
+  int64_t min_frame_age_ms_ = 0;
+  int max_paint_gap_ticks_ = 0;
+  int last_paint_tick_ = 0;
+  std::vector<Measurement> measurements_;
+  std::vector<int> late_ticks_;
+  uint32_t last_pixel_ = 0;
+  Clock::time_point next_tick_;
+  Clock::time_point last_paint_;
+  Clock::time_point tick_time_;
+  Clock::time_point last_paint_tick_time_;
+
+#if defined(OS_MAC)
+  osr_unittests::ScopedTimingActivity timing_activity_;
+#endif
+
+  IMPLEMENT_REFCOUNTING(ExternalBeginFrameTimingTestHandler);
+};
+
 }  // namespace
 
 TEST(OSRTest, SingleFramePaint) {
@@ -2239,6 +2525,27 @@ TEST(OSRTest, SingleFramePaint2x) {
       new SingleBeginFrameTestHandler(2.0f);
   handler->ExecuteTest();
   ReleaseAndWaitForDestructor(handler);
+}
+
+TEST(OSRTest, ExternalBeginFrameTiming) {
+  CefRefPtr<ExternalBeginFrameTimingTestHandler> handler =
+      new ExternalBeginFrameTimingTestHandler(false);
+  handler->ExecuteTest();
+  ReleaseAndWaitForDestructor(handler);
+}
+
+TEST(OSRTest, ExternalBeginFrameTimingAccelerated) {
+  if (CefCommandLine::GetGlobalCommandLine()->HasSwitch("disable-gpu")) {
+    GTEST_SKIP() << "GPU is disabled";
+  }
+  CefRefPtr<ExternalBeginFrameTimingTestHandler> handler =
+      new ExternalBeginFrameTimingTestHandler(true);
+  handler->ExecuteTest();
+  const bool unavailable = handler->readback_unavailable();
+  ReleaseAndWaitForDestructor(handler);
+  if (unavailable) {
+    GTEST_SKIP() << "Shared texture readback is unavailable";
+  }
 }
 
 // generic test
